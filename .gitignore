@@ -1,0 +1,5 @@
+__pycache__/
+/*.json
+/*/*.json
+/mealie-parser/gold/*.jsonl
+/mealie-parser/gold/*.sqlite3

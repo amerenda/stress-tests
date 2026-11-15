@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  jellyfin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install httpx==0.28.1 rich==15.0.0
+      - run: python -m unittest discover -s tests -v
+        working-directory: jellyfin
+      - name: Page script syntax
+        run: |
+          for page in jellyfin/webui/index.html jellyfin/webui/compat.html; do
+            python -c "import re,sys; s=open(sys.argv[1]).read(); open('/tmp/ui.js','w').write(re.search(r'<script>(.*)</script>', s, re.S).group(1))" $page
+            node --check /tmp/ui.js
+          done
+      - name: Docker build
+        run: docker build -f jellyfin/Dockerfile -t jfstress-ui .
+
+  mealie-parser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install httpx==0.28.1
+      - name: CLI and UI tests (engine tests run in the image build)
+        run: python -m unittest discover -s tests -v
+        working-directory: mealie-parser
+      - name: Page script syntax
+        run: |
+          python -c "import re; s=open('mealie-parser/webui/index.html').read(); open('/tmp/ui.js','w').write(re.search(r'<script>(.*)</script>', s, re.S).group(1))"
+          node --check /tmp/ui.js
+      - name: Docker build (runs the engine tests against Mealie's code)
+        run: docker build -f mealie-parser/Dockerfile -t mealie-parser .
