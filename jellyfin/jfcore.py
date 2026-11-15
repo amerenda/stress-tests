@@ -1,0 +1,433 @@
+"""Shared, I/O-free pieces of jfstress: device profiles, HLS parsing, item selection and
+the player buffer model. Used by both the asyncio CLI (jfstress.py) and the Locust
+runner (locustfile.py)."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import statistics
+import sys
+from dataclasses import dataclass, field
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+
+VERSION = "0.2.0"
+CLIENT = "jfstress"
+TICKS = 10_000_000
+MODES = ("direct", "remux", "transcode")
+AUDIO_COPY = "aac,mp3,ac3,eac3,opus,flac,dts,truehd,alac,vorbis"
+# --filter tokens. A file must match every token given.
+RES_FILTERS = ("4k", "1080p", "720p", "sd")
+RANGE_FILTERS = ("hdr", "sdr", "dovi", "hdr10", "hdr10plus")
+CODEC_FILTERS = ("h264", "hevc", "av1", "vp9", "mpeg4", "mpeg2video", "vc1")
+TRAIT_FILTERS = ("10bit", "hi10p", "interlaced", "highbitrate")
+# Subtitle tokens: the file has a subtitle of that format; with --burn-subs, that track is burned in.
+SUB_FILTERS = {"ass": ("ass", "ssa"), "pgs": ("pgssub",), "dvdsub": ("dvdsub",), "srt": ("subrip", "srt")}
+SOURCE_FILTERS = RES_FILTERS + RANGE_FILTERS + CODEC_FILTERS + TRAIT_FILTERS + tuple(SUB_FILTERS)
+HIGH_BITRATE = 40_000_000
+
+
+# --------------------------------------------------------------------------- reports in pod logs
+# The JSON-lines output contract (events, status, report parts, result) is shared by every suite
+# in this repo: see stresskit/output.py. Re-exported here for jfstress, jfcompat and the tests.
+try:
+    from stresskit.output import emit, read_report, report_lines  # noqa: F401
+except ImportError:  # run from a checkout: stresskit sits next to this suite's directory
+    sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from stresskit.output import emit, read_report, report_lines  # noqa: F401
+
+
+# --------------------------------------------------------------------------- auth
+
+def auth_header(device: str, device_id: str, token: str | None = None) -> str:
+    h = (f'MediaBrowser Client="{CLIENT}", Device="{device}", '
+         f'DeviceId="{device_id}", Version="{VERSION}"')
+    if token:
+        h += f', Token="{token}"'
+    return h
+
+
+# --------------------------------------------------------------------------- profiles
+
+def device_profile(mode: str, codec: str, max_bitrate: int, max_height: int | None) -> dict:
+    """Device profile that steers Jellyfin's StreamBuilder to one playback method."""
+    if mode == "remux":
+        tp_video, tp_audio = "h264,hevc,av1,vp9", AUDIO_COPY
+    else:
+        tp_video, tp_audio = codec, "aac"
+    profile: dict = {
+        "Name": f"{CLIENT}-{mode}",
+        "MaxStreamingBitrate": max_bitrate,
+        "MaxStaticBitrate": max_bitrate,
+        "MusicStreamingTranscodingBitrate": 192000,
+        "DirectPlayProfiles": [{"Type": "Video"}, {"Type": "Audio"}] if mode == "direct" else [],
+        "TranscodingProfiles": [{
+            "Container": "ts",
+            "Type": "Video",
+            "VideoCodec": tp_video,
+            "AudioCodec": tp_audio,
+            "Protocol": "hls",
+            "Context": "Streaming",
+            "MaxAudioChannels": "2",
+            "MinSegments": 1,
+            "BreakOnNonKeyFrames": True,
+        }],
+        "ContainerProfiles": [],
+        "CodecProfiles": [],
+        "SubtitleProfiles": [
+            {"Format": f, "Method": "External"} for f in ("vtt", "srt", "ass", "ssa")
+        ] + [{"Format": f, "Method": "Encode"} for f in ("pgssub", "dvdsub", "dvbsub")],
+    }
+    if mode == "transcode" and max_height:
+        profile["CodecProfiles"].append({
+            "Type": "Video",
+            "Conditions": [{"Condition": "LessThanEqual", "Property": "Height",
+                            "Value": str(max_height), "IsRequired": False}],
+        })
+    return profile
+
+
+def subtitle_codecs(filt: set[str]) -> set[str]:
+    """Subtitle codecs named by the subtitle tokens of a filter (empty = any)."""
+    return {c for f in filt if f in SUB_FILTERS for c in SUB_FILTERS[f]}
+
+
+def pick_subtitle(source: dict, codecs: set[str] | None = None) -> dict | None:
+    subs = [m for m in source.get("MediaStreams", []) if m.get("Type") == "Subtitle"]
+    if codecs:
+        subs = [m for m in subs if (m.get("Codec") or "").lower() in codecs]
+    return subs[0] if subs else None
+
+
+def playback_info_body(mode: str, user_id: str, source: dict, start_s: float, *, codec: str,
+                       bitrate: int, max_height: int | None, burn_subs: bool,
+                       sub_codecs: set[str] | None = None) -> dict:
+    body = {
+        "UserId": user_id,
+        "DeviceProfile": device_profile(mode, codec, bitrate, max_height),
+        "MaxStreamingBitrate": bitrate,
+        "StartTimeTicks": int(start_s * TICKS),
+        "EnableDirectPlay": mode == "direct",
+        "EnableDirectStream": mode == "direct",
+        "EnableTranscoding": mode != "direct",
+        "AllowVideoStreamCopy": mode == "remux",
+        "AllowAudioStreamCopy": mode == "remux",
+        "AutoOpenLiveStream": True,
+        "MediaSourceId": source.get("Id"),
+    }
+    if burn_subs and mode == "transcode":
+        sub = pick_subtitle(source, sub_codecs)
+        if sub:
+            body["SubtitleStreamIndex"] = sub["Index"]
+            body["DeviceProfile"]["SubtitleProfiles"] = [
+                {"Format": f, "Method": "Encode"} for f in
+                ("*", "srt", "subrip", "ass", "ssa", "vtt", "pgssub", "dvdsub", "dvbsub")]
+    return body
+
+
+def method_for(mode: str, media_source: dict) -> str:
+    """The playback method the server granted, as Jellyfin's PlayMethod names it."""
+    if (mode == "direct" and media_source.get("SupportsDirectPlay")) or not media_source.get("TranscodingUrl"):
+        return "DirectPlay"
+    return {"remux": "DirectStream", "transcode": "Transcode"}.get(mode, "Transcode")
+
+
+def transcoding_url(mode: str, media_source: dict, overrides: dict[str, str]) -> str:
+    url = media_source["TranscodingUrl"]
+    if mode == "transcode":
+        url = set_params(url, {"AllowVideoStreamCopy": "false", "AllowAudioStreamCopy": "false"})
+    return set_params(url, overrides)
+
+
+def parse_mix(spec: str) -> list[str]:
+    out: list[str] = []
+    for part in spec.split(","):
+        mode, _, n = part.partition("=")
+        mode = mode.strip()
+        if not mode:
+            continue
+        if mode not in MODES:
+            raise ValueError(f"bad mode in mix: {mode!r} (use {', '.join(MODES)})")
+        out += [mode] * int(n or 1)
+    if not out:
+        raise ValueError("empty mix")
+    return out
+
+
+# --------------------------------------------------------------------------- items
+
+ITEM_FIELDS = "MediaSources,MediaStreams,RunTimeTicks"
+
+
+def video_stream(item_or_source: dict) -> dict | None:
+    for s in item_or_source.get("MediaStreams") or []:
+        if s.get("Type") == "Video":
+            return s
+    return None
+
+
+def first_source(item: dict) -> dict:
+    return (item.get("MediaSources") or [{}])[0]
+
+
+def describe_video(vs: dict | None) -> str:
+    if not vs:
+        return "?"
+    res = resolution(vs)
+    rng = vs.get("VideoRangeType") or vs.get("VideoRange") or ""
+    rng = "" if rng in ("SDR", "") else f" {rng}"
+    bits = " 10bit" if (vs.get("BitDepth") or 8) > 8 and vs.get("Codec") == "h264" else ""
+    return f"{res} {vs.get('Codec', '?')}{bits}{rng}"
+
+
+def resolution(vs: dict) -> str:
+    """4k / 1080p / 720p / sd, by width or height so scope (2.39:1) files land in their class."""
+    w, h = vs.get("Width") or 0, vs.get("Height") or 0
+    if w >= 3200 or h >= 1600:
+        return "4K"
+    if w >= 1800 or h >= 900:
+        return "1080p"
+    if w >= 1200 or h >= 700:
+        return "720p"
+    return "SD"
+
+
+def item_label(item: dict) -> str:
+    if item.get("SeriesName"):
+        return f"{item['SeriesName']} {item.get('ParentIndexNumber', 0)}x{item.get('IndexNumber', 0)}"
+    return item.get("Name", "?")
+
+
+def parse_filter(spec: str | None) -> set[str]:
+    filt = {f.strip().lower() for f in (spec or "").split(",") if f.strip() and f.strip().lower() != "any"}
+    bad = filt - set(SOURCE_FILTERS)
+    if bad:
+        raise ValueError(f"unknown source filter(s) {sorted(bad)}; use {', '.join(SOURCE_FILTERS)}")
+    return filt
+
+
+def item_matches(item: dict, filt: set[str], min_runtime_s: float = 600) -> bool:
+    if (item.get("RunTimeTicks") or 0) < min_runtime_s * TICKS:
+        return False
+    src = first_source(item)
+    vs = video_stream(src)
+    if vs is None:
+        return False
+    res = resolution(vs).lower()
+    codec = (vs.get("Codec") or "").lower()
+    rtype = (vs.get("VideoRangeType") or "").upper()
+    hdr = (vs.get("VideoRange") or "SDR") != "SDR"
+    deep = (vs.get("BitDepth") or 8) > 8
+    for f in filt:
+        if f in RES_FILTERS:
+            ok = res == f
+        elif f == "hdr":
+            ok = hdr
+        elif f == "sdr":
+            ok = not hdr
+        elif f == "dovi":
+            ok = rtype.startswith("DOVI")
+        elif f == "hdr10":
+            ok = rtype in ("HDR10", "DOVIWITHHDR10")
+        elif f == "hdr10plus":
+            ok = "HDR10PLUS" in rtype
+        elif f == "10bit":
+            ok = deep
+        elif f == "hi10p":
+            ok = codec == "h264" and deep
+        elif f == "interlaced":
+            ok = bool(vs.get("IsInterlaced"))
+        elif f == "highbitrate":
+            ok = (src.get("Bitrate") or 0) > HIGH_BITRATE
+        elif f in SUB_FILTERS:
+            ok = pick_subtitle(src, set(SUB_FILTERS[f])) is not None
+        else:
+            ok = codec == f
+        if not ok:
+            return False
+    return True
+
+
+def items_query(user_id: str, types: str, parent_id: str | None = None,
+                filt: set[str] | None = None, start: int = 0, limit: int = 400) -> dict:
+    """/Items query. Without a filter: `limit` random items. With one, page through the whole
+    library (start/limit) so rare formats are found; the server pre-filters what it can."""
+    q = {"userId": user_id, "Recursive": "true", "IncludeItemTypes": types, "MediaTypes": "Video",
+         "Fields": ITEM_FIELDS, "IsMissing": "false", "Limit": str(limit)}
+    if filt:
+        q.update({"SortBy": "SortName", "StartIndex": str(start)})
+        if "4k" in filt:
+            q["Is4K"] = "true"
+        if filt & set(SUB_FILTERS):
+            q["HasSubtitles"] = "true"
+    else:
+        q["SortBy"] = "Random"
+    if parent_id:
+        q["ParentId"] = parent_id
+    return q
+
+
+# --------------------------------------------------------------------------- HLS
+
+def set_params(url: str, overrides: dict[str, str]) -> str:
+    if not overrides:
+        return url
+    p = urlsplit(url)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    lower = {k.lower(): k for k in q}
+    for k, v in overrides.items():
+        q[lower.get(k.lower(), k)] = v
+    return urlunsplit(p._replace(query=urlencode(q)))
+
+
+def parse_m3u8(text: str, base: str):
+    """Return (variants, init_uri, segments[(uri, dur)])."""
+    variants, segs, init = [], [], None
+    dur = None
+    lines = [l.strip() for l in text.splitlines()]
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF"):
+            nxt = next((l for l in lines[i + 1:] if l and not l.startswith("#")), None)
+            if nxt:
+                variants.append(urljoin(base, nxt))
+        elif line.startswith("#EXT-X-MAP"):
+            m = re.search(r'URI="([^"]+)"', line)
+            if m:
+                init = urljoin(base, m.group(1))
+        elif line.startswith("#EXTINF:"):
+            dur = float(line[8:].split(",")[0])
+        elif line and not line.startswith("#") and dur is not None:
+            segs.append((urljoin(base, line), dur))
+            dur = None
+    return variants, init, segs
+
+
+def seek_index(segs: list[tuple[str, float]], start_s: float) -> int:
+    """Segment index to start from. Jellyfin's playlist covers the whole item, so a start
+    offset is a seek to the segment that contains it (Jellyfin restarts ffmpeg there)."""
+    if not start_s or sum(d for _, d in segs) <= start_s + 60:
+        return 0
+    acc = 0.0
+    for i, (_, d) in enumerate(segs):
+        if acc >= start_s:
+            return i
+        acc += d
+    return 0
+
+
+# --------------------------------------------------------------------------- player model
+
+@dataclass
+class HealthConfig:
+    startup_buffer: float = 6.0   # media s buffered before playback starts
+    rebuffer: float = 4.0         # media s needed to resume after a stall
+    max_buffer: float = 30.0      # player buffer ceiling
+    min_speed: float = 1.0        # fill speed (x real time) below which a non-full stream is behind
+    grace: float = 15.0           # s a stream may be behind before it counts as degraded
+    max_startup: float = 30.0     # startup slower than this counts as degraded
+
+
+@dataclass
+class Player:
+    """Buffer model of one viewer. Times are monotonic seconds supplied by the caller."""
+    cfg: HealthConfig
+    state: str = "init"           # init, starting, playing, stalled, done, error
+    t_start: float = 0.0
+    startup_s: float | None = None
+    stalls: int = 0
+    stall_s: float = 0.0
+    downloaded_s: float = 0.0
+    played_s: float = 0.0
+    bytes: int = 0
+    seg_speeds: list[float] = field(default_factory=list)
+    seg_fetch_max: float = 0.0
+    behind_since: float | None = None
+    _last: float = 0.0
+    _stall_t0: float = 0.0
+    on_stall_start: object = None   # callable() hooks for metrics
+    on_stall_end: object = None     # callable(seconds)
+    on_startup: object = None       # callable(seconds)
+
+    def begin(self, now: float) -> None:
+        self.state, self.t_start, self._last = "starting", now, now
+
+    @property
+    def buffer(self) -> float:
+        return self.downloaded_s - self.played_s
+
+    def tick(self, now: float) -> None:
+        if self.state == "playing":
+            el = now - self._last
+            if self.played_s + el >= self.downloaded_s:
+                self._stall_t0 = self._last + (self.downloaded_s - self.played_s)
+                self.played_s = self.downloaded_s
+                self.state = "stalled"
+                self.stalls += 1
+                if self.on_stall_start:
+                    self.on_stall_start()
+            else:
+                self.played_s += el
+        self._last = now
+
+    def got_media(self, now: float, secs: float, fetch_s: float | None = None) -> None:
+        self.tick(now)
+        self.downloaded_s += secs
+        if fetch_s is not None:
+            self.seg_speeds.append(secs / max(fetch_s, 1e-3))
+            if len(self.seg_speeds) > 3:
+                self.seg_fetch_max = max(self.seg_fetch_max, fetch_s)
+        if self.state == "starting" and self.buffer >= self.cfg.startup_buffer:
+            self.state = "playing"
+            self.startup_s = now - self.t_start
+            if self.on_startup:
+                self.on_startup(self.startup_s)
+        elif self.state == "stalled" and self.buffer >= self.cfg.rebuffer:
+            d = now - self._stall_t0
+            self.stall_s += d
+            self.state = "playing"
+            if self.on_stall_end:
+                self.on_stall_end(d)
+        self._last = now
+
+    def room(self, now: float) -> bool:
+        """True if the player wants more data now."""
+        self.tick(now)
+        return self.state != "playing" or self.buffer < self.cfg.max_buffer
+
+    def speed(self, n: int = 5) -> float | None:
+        s = self.seg_speeds[3:][-n:]  # skip ffmpeg spin-up segments
+        return statistics.median(s) if s else None
+
+    @property
+    def active(self) -> bool:
+        return self.state in ("starting", "playing", "stalled")
+
+    @property
+    def undecided(self) -> bool:
+        """Too early to call this viewer healthy: still starting, too few fill samples
+        to judge, or currently behind but inside the grace period. A ramp level only
+        counts as held once no active viewer is undecided."""
+        if self.state == "starting":
+            return True
+        if self.state == "playing":
+            return len(self.seg_speeds) < 5 or self.behind_since is not None
+        return False
+
+    def degraded(self, now: float) -> str | None:
+        """Reason a viewer would notice a problem right now, or None."""
+        self.tick(now)  # advance playback even while a segment fetch is blocked
+        if self.state == "error":
+            return "error"
+        if self.state == "stalled":
+            return "stalled"
+        if self.state == "starting" and now - self.t_start > self.cfg.max_startup:
+            return f"startup>{self.cfg.max_startup:.0f}s"
+        sp = self.speed()
+        if (self.state == "playing" and sp is not None and sp < self.cfg.min_speed
+                and self.buffer < self.cfg.max_buffer * 0.9):
+            self.behind_since = self.behind_since or now
+            if now - self.behind_since >= self.cfg.grace:
+                return f"fill {sp:.2f}x"
+        else:
+            self.behind_since = None
+        return None
